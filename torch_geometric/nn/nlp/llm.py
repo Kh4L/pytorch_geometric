@@ -80,13 +80,21 @@ class LLM(torch.nn.Module):
 
         # A rough heuristic on GPU memory requirements, e.g., we found that
         # LLAMA2 (7B parameters) fits on a 85GB GPU.
-        required_memory = 85 * num_params / 7
+        if "llama-4" in model_name.lower():
+            required_memory = 560
+        else:
+            required_memory = 85 * num_params / 7
+
         kwargs = get_llm_kwargs(required_memory, dtype)
+
+        if "llama-4" in model_name.lower():
+            kwargs["attn_implementation"]="eager"
+
 
         print(f"Setting up '{model_name}' with configuration: {kwargs}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
-            use_fast=False,
+            use_fast="llama-4" in model_name.lower(),
         )
         self.tokenizer.pad_token_id = PAD_TOKEN_ID
         self.tokenizer.padding_side = PADDING_SIDE

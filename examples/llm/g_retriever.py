@@ -402,7 +402,7 @@ if __name__ == '__main__':
     parser.add_argument('--cwq', action='store_true')
     parser.add_argument('--tiny_llama', action='store_true')
     parser.add_argument('--llm_model_name', type=str,
-                        default="meta-llama/Meta-Llama-3.1-8B-Instruct")
+                        default="meta-llama/Llama-4-Scout-17B-16E-Instruct")
     args = parser.parse_args()
 
     start_time = time.time()
