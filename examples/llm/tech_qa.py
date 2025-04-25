@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import os
+import os.path as osp
 import random
 import re
 import sys
@@ -64,6 +65,30 @@ DOC_CHUNK_SIZE_DEFAULT = 8192
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    ############################################################
+    ############## General arguments ###########################
+    ############################################################
+    parser.add_argument('--dataset', type=str, default="tech_qa",
+                        help="The dataset to use.")
+    parser.add_argument(
+        '--num_gpus', type=int, default=None,
+        help="Number of GPUs to use. If not specified,"
+        "will determine automatically based on model size.")
+    parser.add_argument('--dont_save_model', action="store_true",
+                        help="Whether to skip model saving.")
+    
+    
+    ############################################################
+    ############## Dataset related arguments ##################
+    ############################################################
+    parser.add_argument('--regenerate_dataset', action="store_true",
+                        help="Regenerate the dataset")
+    parser.add_argument('--doc_parsing_mode', type=str, default="paragraph", 
+                       choices=["file", "paragraph"],
+                       help="How to parse documents: 'file' treats each file as one document, 'paragraph' splits files by paragraphs")
+    ############################################################
+    ############## LLM related arguments ###############
+    ############################################################
     parser.add_argument('--NV_NIM_MODEL', type=str,
                         default=NV_NIM_MODEL_DEFAULT,
                         help="The NIM LLM to use for TXT2KG for LLMJudge")
@@ -77,12 +102,26 @@ def parse_args():
         '--kg_chunk_size', type=int, default=512,
         help="When splitting context documents for txt2kg,\
         the maximum number of characters per chunk.")
+    parser.add_argument('--llm_generator_name', type=str,
+                        default=LLM_GENERATOR_NAME_DEFAULT,
+                        help="The LLM to use for Generation")
+    parser.add_argument(
+        '--llm_generator_mode', type=str, default=LLM_GEN_MODE_DEFAULT,
+        choices=["frozen", "lora",
+                 "full"], help="Whether to freeze the Generator LLM,\
+                        use LORA, or fully finetune")
+    ############################################################
+    ############## GNN related arguments #######################
+    ############################################################
     parser.add_argument('--gnn_hidden_channels', type=int,
                         default=GNN_HID_CHANNELS_DEFAULT,
                         help="Hidden channels for GNN")
     parser.add_argument('--num_gnn_layers', type=int,
                         default=GNN_LAYERS_DEFAULT,
                         help="Number of GNN layers")
+    ############################################################
+    ############## Training related arguments #################
+    ############################################################
     parser.add_argument('--lr', type=float, default=LR_DEFAULT,
                         help="Learning rate")
     parser.add_argument('--epochs', type=int, default=EPOCHS_DEFAULT,
@@ -92,33 +131,22 @@ def parse_args():
     parser.add_argument('--eval_batch_size', type=int,
                         default=EVAL_BATCH_SIZE_DEFAULT,
                         help="Evaluation batch size")
-    parser.add_argument('--llm_generator_name', type=str,
-                        default=LLM_GENERATOR_NAME_DEFAULT,
-                        help="The LLM to use for Generation")
     parser.add_argument(
         '--doc_chunk_size', type=int, default=DOC_CHUNK_SIZE_DEFAULT,
         help="The chunk size to use VectorRAG (document retrieval)")
-    parser.add_argument(
-        '--llm_generator_mode', type=str, default=LLM_GEN_MODE_DEFAULT,
-        choices=["frozen", "lora",
-                 "full"], help="Whether to freeze the Generator LLM,\
-                        use LORA, or fully finetune")
-    parser.add_argument('--dont_save_model', action="store_true",
-                        help="Whether to skip model saving.")
     parser.add_argument('--k_for_docs', type=int, default=2,
                         help="Number of docs to retrieve for each question.")
+
+    ############################################################
+    ############## Logging related arguments ##################
+    ############################################################
     parser.add_argument('--log_steps', type=int, default=30,
                         help="Log to wandb every N steps")
     parser.add_argument('--wandb_project', type=str, default="tech-qa",
                         help="Weights & Biases project name")
     parser.add_argument('--wandb', action="store_true",
                         help="Enable wandb logging")
-    parser.add_argument(
-        '--num_gpus', type=int, default=None,
-        help="Number of GPUs to use. If not specified,"
-        "will determine automatically based on model size.")
-    parser.add_argument('--regenerate_dataset', action="store_true",
-                        help="Regenerate the dataset")
+
     return parser.parse_args()
 
 
@@ -134,12 +162,13 @@ prompt_template = """Answer this question based on retrieved contexts. Just give
     Answer: """
 
 
-def _process_and_chunk_text(text, chunk_size):
+def _process_and_chunk_text(text, chunk_size, doc_parsing_mode):
     full_chunks = []
     # Some corpora of docs are grouped into chunked files, typically by paragraph.
     # Only split into individual documents if many paragraphs are detected
-    paragraphs = re.split(r'\n{2,}', text)
-    if len(paragraphs) < 16:
+    if doc_parsing_mode == "paragraph":
+        paragraphs = re.split(r'\n{2,}', text)
+    else: # doc_parsing_mode == "file":
         paragraphs = [text]
 
     for paragraph in paragraphs:
@@ -148,9 +177,9 @@ def _process_and_chunk_text(text, chunk_size):
     return full_chunks
 
 
-def get_data(args):
+def read_raw_data(args):
     # need a JSON dict of Questions and answers, see below for how its used
-    with open('train.json') as file:
+    with open(osp.join(args.dataset, "train.json")) as file:
         json_obj = json.load(file)
     text_contexts = []
 
@@ -159,7 +188,7 @@ def get_data(args):
     # TODO: add support for additional corpus file formats: PDF, CSV, XML,
     # HTML, possibly others.
     # corpus folder is simply a folder with context documents in it.
-    file_paths = glob(f"corpus/*.json")
+    file_paths = glob(osp.join(args.dataset, "corpus/*.json"))
     if len(file_paths) > 0:
         for file_path in file_paths:
             with open(file_path, "r+") as f:
@@ -170,76 +199,85 @@ def get_data(args):
                                  f"text only but got {doc_type}")
             text_contexts.extend(
                 _process_and_chunk_text(data[0]["metadata"]["content"],
-                                        args.doc_chunk_size))
+                                        args.doc_chunk_size, args.doc_parsing_mode))
     else:
-        for file_path in glob(f"corpus/*"):
+        for file_path in glob(osp.join(args.dataset, "corpus/*")):
             with open(file_path, "r+") as f:
                 text_context = f.read()
             text_contexts.extend(
-                _process_and_chunk_text(text_context, args.doc_chunk_size))
+                _process_and_chunk_text(text_context,
+                                        args.doc_chunk_size,
+                                        args.doc_parsing_mode))
 
     return json_obj, text_contexts
 
+def index_kg(args, context_docs):
+    kg_maker = TXT2KG(NVIDIA_NIM_MODEL=args.NV_NIM_MODEL,
+                        NVIDIA_API_KEY=args.NV_NIM_KEY,
+                        ENDPOINT_URL=args.ENDPOINT_URL,
+                        chunk_size=args.kg_chunk_size)
+    print(
+        "Note that if the TXT2KG process is too slow for you're liking using the public NIM, consider deploying yourself using local_lm flag of TXT2KG or using https://build.nvidia.com/nvidia/llama-3_1-nemotron-70b-instruct?snippet_tab=Docker to deploy to a private endpoint, which you can pass to this script w/ --ENDPOINT_URL flag."
+    )  # noqa
+    total_tqdm_count = len(context_docs)
+    initial_tqdm_count = 0
+    if osp.exists(osp.join(args.dataset, "checkpoint_kg.pt")):
+        print("Restoring KG from checkpoint...")
+        saved_relevant_triples = torch.load(osp.join(args.dataset, "checkpoint_kg.pt"),
+                                            weights_only=False)
+        kg_maker.relevant_triples = saved_relevant_triples
+        kg_maker.doc_id_counter = len(saved_relevant_triples)
+        initial_tqdm_count = kg_maker.doc_id_counter
+        context_docs = context_docs[kg_maker.doc_id_counter:]
+
+    chkpt_interval = 10
+    chkpt_count = 0
+    for context_doc in tqdm(context_docs, total=total_tqdm_count,
+                            initial=initial_tqdm_count,
+                            desc="Extracting KG triples"):
+        kg_maker.add_doc_2_KG(txt=context_doc)
+        chkpt_count += 1
+        if chkpt_count == chkpt_interval:
+            chkpt_count = 0
+            kg_maker.save_kg("checkpoint_kg.pt")
+    relevant_triples = kg_maker.relevant_triples
+
+    triples.extend(
+        list(
+            chain.from_iterable(
+                triple_set
+                for triple_set in relevant_triples.values())))
+    triples = list(dict.fromkeys(triples))
+    torch.save(triples, osp.join(args.dataset, f"{args.dataset}_just_triples.pt"))
+    if osp.exists(osp.join(args.dataset, "checkpoint_kg.pt")):
+        os.remove(osp.join(args.dataset, "checkpoint_kg.pt"))
+    return triples
+
+def retrieve(qa_pairs, kg, context_docs):
+    pass
 
 def make_dataset(args):
-    if os.path.exists("tech_qa.pt") and not args.regenerate_dataset:
+    processed_path = osp.join(args.dataset, f"{args.dataset}_processed.pt")
+    if osp.exists(processed_path) and not args.regenerate_dataset:
         print("Re-using Saved TechQA KG-RAG Dataset...")
-        return torch.load("tech_qa.pt", weights_only=False)
+        return torch.load(processed_path, weights_only=False)
     else:
-        qa_pairs, context_docs = get_data(args)
+        qa_pairs, context_docs = read_raw_data(args)
         print("Number of Docs in our VectorDB =", len(context_docs))
         data_lists = {"train": [], "validation": [], "test": []}
         triples = []
-        if os.path.exists("tech_qa_just_triples.pt"):
-            triples = torch.load("tech_qa_just_triples.pt", weights_only=False)
+        if osp.exists(osp.join(args.dataset, f"{args.dataset}_just_triples.pt")):
+            triples = torch.load(osp.join(args.dataset, f"{args.dataset}_just_triples.pt"), weights_only=False)
         else:
-            kg_maker = TXT2KG(NVIDIA_NIM_MODEL=args.NV_NIM_MODEL,
-                              NVIDIA_API_KEY=args.NV_NIM_KEY,
-                              ENDPOINT_URL=args.ENDPOINT_URL,
-                              chunk_size=args.kg_chunk_size)
-            print(
-                "Note that if the TXT2KG process is too slow for you're liking using the public NIM, consider deploying yourself using local_lm flag of TXT2KG or using https://build.nvidia.com/nvidia/llama-3_1-nemotron-70b-instruct?snippet_tab=Docker to deploy to a private endpoint, which you can pass to this script w/ --ENDPOINT_URL flag."
-            )  # noqa
-            total_tqdm_count = len(context_docs)
-            initial_tqdm_count = 0
-            if os.path.exists("checkpoint_kg.pt"):
-                print("Restoring KG from checkpoint...")
-                saved_relevant_triples = torch.load("checkpoint_kg.pt",
-                                                    weights_only=False)
-                kg_maker.relevant_triples = saved_relevant_triples
-                kg_maker.doc_id_counter = len(saved_relevant_triples)
-                initial_tqdm_count = kg_maker.doc_id_counter
-                context_docs = context_docs[kg_maker.doc_id_counter:]
-
-            chkpt_interval = 10
-            chkpt_count = 0
-            for context_doc in tqdm(context_docs, total=total_tqdm_count,
-                                    initial=initial_tqdm_count,
-                                    desc="Extracting KG triples"):
-                kg_maker.add_doc_2_KG(txt=context_doc)
-                chkpt_count += 1
-                if chkpt_count == chkpt_interval:
-                    chkpt_count = 0
-                    kg_maker.save_kg("checkpoint_kg.pt")
-            relevant_triples = kg_maker.relevant_triples
-
-            triples.extend(
-                list(
-                    chain.from_iterable(
-                        triple_set
-                        for triple_set in relevant_triples.values())))
-            triples = list(dict.fromkeys(triples))
-            torch.save(triples, "tech_qa_just_triples.pt")
-            if os.path.exists("checkpoint_kg.pt"):
-                os.remove("checkpoint_kg.pt")
+            triples = index_kg(args, context_docs)
 
         print("Number of triples in our GraphDB =", len(triples))
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         sent_trans_batch_size = 256
-        model = SentenceTransformer(
+        encoder = SentenceTransformer(
             model_name='Alibaba-NLP/gte-modernbert-base').to(device)
         fs, gs = create_remote_backend_from_triplets(
-            triplets=triples, node_embedding_model=model,
+            triplets=triples, node_embedding_model=encoder,
             node_method_to_call="encode", path="backend",
             pre_transform=preprocess_triplet, node_method_kwargs={
                 "batch_size": min(len(triples), sent_trans_batch_size),
@@ -251,7 +289,7 @@ def make_dataset(args):
         Tuning may be needed for custom data...
         """
         # encode the raw context docs
-        embedded_docs = model.encode(context_docs, output_device=device,
+        embedded_docs = encoder.encode(context_docs, output_device=device,
                                      batch_size=int(sent_trans_batch_size / 4),
                                      verbose=True)
         # k for KNN
@@ -275,7 +313,7 @@ def make_dataset(args):
         query_loader = RAGQueryLoader(
             data=(fs, gs), seed_nodes_kwargs={"k_nodes": knn_neighsample_bs},
             sampler_kwargs={"num_neighbors": [fanout] * num_hops},
-            local_filter=make_pcst_filter(triples, model),
+            local_filter=make_pcst_filter(triples, encoder),
             local_filter_kwargs=local_filter_kwargs, raw_docs=context_docs,
             embedded_docs=embedded_docs, k_for_docs=args.k_for_docs)
         total_data_list = []
@@ -289,6 +327,7 @@ def make_dataset(args):
             subgraph.label = QA_pair[1]
             total_data_list.append(subgraph)
             extracted_triple_sizes.append(len(subgraph.triples))
+
         random.shuffle(total_data_list)
         print("Min # of Retrieved Triples =", min(extracted_triple_sizes))
         print("Max # of Retrieved Triples =", max(extracted_triple_sizes))
@@ -301,7 +340,7 @@ def make_dataset(args):
             int(.6 * len(total_data_list)):int(.8 * len(total_data_list))]
         data_lists["test"] = total_data_list[int(.8 * len(total_data_list)):]
 
-        torch.save(data_lists, "tech_qa.pt")
+        torch.save(data_lists, processed_path)
         del model
         gc.collect()
         torch.cuda.empty_cache()
@@ -327,7 +366,7 @@ def train(args, data_lists):
                              drop_last=False, pin_memory=True, shuffle=False)
     gnn = GAT(in_channels=768, hidden_channels=hidden_channels,
               out_channels=1024, num_layers=num_gnn_layers, heads=4)
-    if args.llm_generator_mode == "full":
+    if args.llm_generator_mode == "full":   
         llm = LLM(model_name=args.llm_generator_name, n_gpus=args.num_gpus)
         model = GRetriever(llm=llm, gnn=gnn)
     elif args.llm_generator_mode == "lora":
@@ -341,10 +380,10 @@ def train(args, data_lists):
         for _, p in llm.named_parameters():
             p.requires_grad = False
         model = GRetriever(llm=llm, gnn=gnn)
-    save_name = "tech-qa-model.pt"
-    if os.path.exists(save_name) and not args.regenerate_dataset:
+    saved_model_path = osp.join(args.dataset, f"{args.dataset}-model.pt")
+    if osp.exists(saved_model_path) and not args.regenerate_dataset:
         print("Re-using saved G-retriever model for testing...")
-        model = load_params_dict(model, save_name)
+        model = load_params_dict(model, saved_model_path)
     else:
         params = [p for _, p in model.named_parameters() if p.requires_grad]
         lr = args.lr
@@ -430,7 +469,7 @@ def train(args, data_lists):
         torch.cuda.reset_max_memory_allocated()
         model.eval()
         if not args.dont_save_model:
-            save_params_dict(model, save_path=save_name)
+            save_params_dict(model, save_path=saved_model_path)
     return model, test_loader
 
 
